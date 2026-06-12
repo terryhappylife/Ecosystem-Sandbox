@@ -59,6 +59,7 @@
     <button class="pw" data-p="forest">🌲 造林</button>
     <button class="pw" data-p="plague">🦠 瘟疫</button>
     <button class="pw" data-p="meteor">☄️ 灾祸</button>
+    <button class="pw" data-p="charm">🌀 蛊惑</button>
     <label>笔刷 <input type="range" id="brush" min="1" max="6" value="2"><span id="brushVal">2</span></label>
   </div>
 
@@ -129,6 +130,7 @@ const MAX_EVENTS=15;
 const RACE_IDX={forest:1,dwarf:2,nomad:3,sea:4,human:5};
 const TERR_COL=['','#00e676','#ff9100','#ff1744','#00b0ff','#ffea00'];
 let power='rain', brushR=2, hoverI=-1, hoverJ=-1, painting=false, showBorder=false;
+let charmState=null;  // { agent, step } 蛊惑选中状态
 
 function biomeOf(e,m,t){
   if(e<0.34) return 'DEEPSEA';
@@ -406,6 +408,7 @@ const MAX_WORLD_BOSS=2;                 // 每局最多2次世界BOSS
 const WORLD_BOSS_INTERVAL=5400;         // 世界BOSS间隔 90秒@60fps
 const WORLD_BOSS_HP=300;
 const RACE_BOSS_HP=150;
+const RACE_BOSS_FIRST_SPAWN=900;        // 种族BOSS首次生成 15秒
 const RACE_BOSS_RESPAWN=7200;           // 种族BOSS重生 120秒
 const ARTIFACT_DURATION=5400;           // 神器持续 90秒
 const ARTIFACTS={
@@ -502,13 +505,17 @@ function combatTick(){
         let attackRange=1.1;
         const aArt=activeArtifacts[a.race];
         if(aArt && frame<aArt.endFrame && ARTIFACTS[aArt.key].effect==='range') attackRange=2.1;
-        if(Math.hypot(a.x-b.x,a.y-b.y)<attackRange && Math.random()<0.35){
+        const aCharmed=a.charm && frame<a.charm.endFrame && a.charm.targetRace===b.race;
+        const bCharmed=b.charm && frame<b.charm.endFrame && b.charm.targetRace===a.race;
+        if(Math.hypot(a.x-b.x,a.y-b.y)<attackRange && (aCharmed || bCharmed || Math.random()<0.35)){
           a.fight=8; b.fight=8;
           const idxA=Math.round(a.y)*W+Math.round(a.x), idxB=Math.round(b.y)*W+Math.round(b.x);
           const homeA=HAB[a.race].includes(biome[idxA])?HOME_BONUS[a.race]:1.0;
           const homeB=HAB[b.race].includes(biome[idxB])?HOME_BONUS[b.race]:1.0;
-          const sa=STR[a.race]*RANK_MULT[a.rank]*(0.5+Math.random())*(auraBonus.get(a)||1)*homeA*(buffBonus.get(a)||1);
-          const sb=STR[b.race]*RANK_MULT[b.rank]*(0.5+Math.random())*(auraBonus.get(b)||1)*homeB*(buffBonus.get(b)||1);
+          let sa=STR[a.race]*RANK_MULT[a.rank]*(0.5+Math.random())*(auraBonus.get(a)||1)*homeA*(buffBonus.get(a)||1);
+          let sb=STR[b.race]*RANK_MULT[b.rank]*(0.5+Math.random())*(auraBonus.get(b)||1)*homeB*(buffBonus.get(b)||1);
+          if(aCharmed) sa*=1.5;
+          if(bCharmed) sb*=1.5;
           let winner, loser;
           if(sa>=sb){ dead.add(b); winner=a; loser=b; }
           else { dead.add(a); winner=b; loser=a; }
@@ -591,7 +598,7 @@ function createWorldBoss(){
   return { type:'world', x:i+0.5, y:j+0.5, hp:WORLD_BOSS_HP, maxHp:WORLD_BOSS_HP, lastAttack:0 };
 }
 function createRaceBoss(race){
-  // 优先：生成在该族人口最密集的格子
+  // 优先：生成在该族人口最密集且有支援的格子
   const raceAgents=agents.filter(a=>a.race===race);
   if(raceAgents.length>=3){
     const posCount=new Map();
@@ -605,7 +612,14 @@ function createRaceBoss(race){
     }
     if(bestKey && bestCount>=3){
       const [i,j]=bestKey;
-      return { type:'race', race, x:i+0.5, y:j+0.5, hp:RACE_BOSS_HP, maxHp:RACE_BOSS_HP, active:false };
+      // 检查周围3格内是否有足够同族支援
+      let nearby=0;
+      for(const a of raceAgents){
+        if(Math.hypot(a.x-(i+0.5), a.y-(j+0.5))<3) nearby++;
+      }
+      if(nearby>=5){
+        return { type:'race', race, x:i+0.5, y:j+0.5, hp:RACE_BOSS_HP, maxHp:RACE_BOSS_HP, active:false };
+      }
     }
   }
   // Fallback：栖息地内部+大后方
@@ -677,9 +691,17 @@ function bossTick(){
   // 种族BOSS生成/重生
   for(const race of Object.keys(HAB)){
     if(!raceBosses[race] || raceBosses[race].dead){
-      if(!raceBosses[race] || frame>=raceBosses[race].respawnFrame){
-        raceBosses[race]=createRaceBoss(race);
-        if(raceBosses[race]) pushEvent('normal', RACE_NAME[race]+' 的守护神殿已苏醒');
+      const firstSpawn=!raceBosses[race];
+      const nextFrame=firstSpawn?RACE_BOSS_FIRST_SPAWN:(raceBosses[race].respawnFrame||frame+1800);
+      if(frame>=nextFrame){
+        const boss=createRaceBoss(race);
+        if(boss){
+          raceBosses[race]=boss;
+          pushEvent('normal', RACE_NAME[race]+' 的守护神殿已苏醒');
+        } else {
+          // 该族灭绝或过于分散，延迟30秒再试
+          raceBosses[race]={ dead:true, respawnFrame:frame+1800 };
+        }
       }
     }
   }
@@ -945,6 +967,47 @@ function applyPower(ci,cj){
       }
     }
     renderBg(); if(n){ flashMsg('☄️ 天降灾祸，'+n+' 人罹难'); pushEvent('warning','天降灾祸，'+n+' 人罹难'); }
+  } else if(power==='charm'){
+    // 蛊惑：第一步选中范围内所有幸存者，第二步指定目标种族
+    if(!charmState || charmState.step===1){
+      let targets=[];
+      for(const a of agents){
+        if(Math.hypot(a.x-(ci+0.5), a.y-(cj+0.5)) <= brushR+0.5) targets.push(a);
+      }
+      if(targets.length===0){
+        charmState=null;
+        flashMsg('🌀 取消蛊惑');
+        return;
+      }
+      charmState={ agents:targets, step:2 };
+      flashMsg('🌀 已选中 '+targets.length+' 名幸存者，再点击目标种族');
+    } else {
+      // 第二步：找点击位置最近的agent确定目标种族
+      let target=null, minD=Infinity;
+      for(const a of agents){
+        const d=Math.hypot(a.x-(ci+0.5), a.y-(cj+0.5));
+        if(d<minD){ minD=d; target=a; }
+      }
+      if(!target || minD>2.0){
+        flashMsg('🌀 请点击一个目标种族的单位');
+        return;
+      }
+      const targetRace=target.race;
+      let count=0;
+      for(const agent of charmState.agents){
+        if(agent.race !== targetRace){
+          agent.charm={ targetRace:targetRace, endFrame:frame+600 };
+          count++;
+        }
+      }
+      if(count===0){
+        flashMsg('🌀 选中范围内没有可蛊惑攻击 '+RACE_NAME[targetRace]+' 的单位');
+        return;
+      }
+      flashMsg('🌀 '+count+' 人被蛊惑攻击 '+RACE_NAME[targetRace]+'！');
+      pushEvent('warning', count+' 人受到蛊惑，开始攻击 '+RACE_NAME[targetRace]);
+      charmState=null;
+    }
   }
 }
 
@@ -995,6 +1058,12 @@ function drawAgent(ctx,a){
     else if(a.rank===2){ ctx.fillStyle='#ffd700'; ctx.fillRect(-1,-19+rbob,2,2); }
     else if(a.rank===3){ ctx.fillStyle='#ffd700'; ctx.fillRect(-3,-20+rbob,6,2); ctx.fillStyle='#ffea00'; ctx.fillRect(-2,-21+rbob,4,1); }
   }
+  // 蛊惑标记
+  if(a.charm && frame<a.charm.endFrame){
+    ctx.strokeStyle='#e040fb'; ctx.lineWidth=1.5;
+    ctx.strokeRect(-4,-17+bob,8,8);
+    ctx.fillStyle='#e040fb'; ctx.fillRect(-1,-15+bob,2,2);
+  }
   if(a.plague>0){ ctx.fillStyle='#d23b30'; ctx.fillRect(-1,-15,2,2); }  // 瘟疫标记
   if(a.hunger>70){ ctx.fillStyle='#e0b020'; ctx.fillRect(2,-13,1.5,1.5); } // 饥饿标记
   if(a.fight>0){ ctx.fillStyle='#ff3b30'; ctx.fillRect(-2,-16,4,2);        // 交战火花
@@ -1020,6 +1089,13 @@ function draw(){
   // BOSS绘制在最上层
   if(worldBoss) drawBoss(ctx,worldBoss);
   for(const race of Object.keys(raceBosses)){ const b=raceBosses[race]; if(b && !b.dead) drawBoss(ctx,b); }
+  // 蛊惑选中标记
+  if(charmState && charmState.agents){
+    ctx.strokeStyle='#e040fb'; ctx.lineWidth=1.5;
+    for(const a of charmState.agents){
+      ctx.beginPath(); ctx.arc(a.x*CELL, a.y*CELL, CELL*1.2, 0, Math.PI*2); ctx.stroke();
+    }
+  }
   if(hoverI>=0 && hoverI<W){                       // 神力笔刷光标
     ctx.strokeStyle='rgba(255,255,255,0.75)'; ctx.lineWidth=1.5;
     ctx.beginPath(); ctx.arc((hoverI+0.5)*CELL,(hoverJ+0.5)*CELL,(brushR+0.5)*CELL,0,Math.PI*2); ctx.stroke();
@@ -1033,6 +1109,19 @@ function tick(){
     if(frame%10===0) bossTick();
     for(const a of agents){
       if(a.fight>0) a.fight--;
+      // 蛊惑状态：主动追踪目标种族
+      if(a.charm && frame<a.charm.endFrame){
+        let target=null, minD=Infinity;
+        for(const b of agents){
+          if(b.race===a.charm.targetRace){
+            const d=Math.hypot(a.x-b.x, a.y-b.y);
+            if(d<minD && d<15){ minD=d; target=b; }
+          }
+        }
+        if(target){ a.tx=target.x; a.ty=target.y; a.rest=0; }
+      } else if(a.charm && frame>=a.charm.endFrame){
+        a.charm=null;
+      }
       if(a.rest>0){ a.rest--; a.moving=false; continue; }
       const dx=a.tx-a.x, dy=a.ty-a.y, dist=Math.hypot(dx,dy);
       if(dist<0.4){ a.moving=false; a.rest=30+Math.random()*90; pickTarget(a); }
