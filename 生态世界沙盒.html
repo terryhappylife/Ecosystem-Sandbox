@@ -68,6 +68,7 @@
     <button class="pw" data-p="meteor">☄️ 灾祸</button>
     <button class="pw" data-p="charm">🌀 蛊惑</button>
     <label>笔刷 <input type="range" id="brush" min="1" max="6" value="2"><span id="brushVal">2</span></label>
+    <label><input type="checkbox" id="terraform"> 地形侵蚀</label>
   </div>
 
   <div id="hud" style="font-size:13px;color:var(--sub);margin-bottom:10px;"></div>
@@ -118,8 +119,27 @@ const BIO={
   GRASS:'#8fb84e', PLAIN:'#a8c062', FOREST:'#3f7d3a', SWAMP:'#46604a',
   HILL:'#9a8f76', MOUNT:'#857f78', ROCK:'#6c6862', SNOW:'#e6ecf1', RIVER:'#3f93cf', VOLCANO:'#a83a2c'
 };
-// 四族适宜栖息 biome
-const HAB={ forest:['FOREST','PLAIN'], dwarf:['MOUNT','HILL'], nomad:['GRASS','PLAIN'], sea:['SWAMP','BEACH','SEA'], human:['PLAIN','GRASS'] };
+// 四族适宜栖息 biome（适性≥0.8 视为核心栖息地，用于计算 KCAP）
+const HAB={ forest:['FOREST','PLAIN'], dwarf:['MOUNT','HILL'], nomad:['GRASS','PLAIN','HILL'], sea:['SWAMP','BEACH','SEA'], human:['PLAIN','GRASS'] };
+// 地形适性表：0=无法生存，0.5=勉强可居，1.0=最佳栖息地
+const TERRAIN_FIT={
+  forest:{ FOREST:1.0, PLAIN:0.80, GRASS:0.50, HILL:0.30, MOUNT:0.10, SWAMP:0.30, BEACH:0.40, SEA:0.50, DEEPSEA:0.00, DESERT:0.20, SNOW:0.10, ROCK:0.10, VOLCANO:0.10 },
+  dwarf: { FOREST:0.30, PLAIN:0.40, GRASS:0.30, HILL:0.90, MOUNT:1.00, SWAMP:0.10, BEACH:0.20, SEA:0.50, DEEPSEA:0.00, DESERT:0.30, SNOW:0.40, ROCK:0.50, VOLCANO:0.30 },
+  nomad:{ FOREST:0.60, PLAIN:1.00, GRASS:1.00, HILL:1.00, MOUNT:0.20, SWAMP:0.20, BEACH:0.50, SEA:0.50, DEEPSEA:0.00, DESERT:0.40, SNOW:0.20, ROCK:0.10, VOLCANO:0.10 },
+  sea:   { FOREST:0.20, PLAIN:0.30, GRASS:0.30, HILL:0.10, MOUNT:0.10, SWAMP:1.00, BEACH:1.00, SEA:1.00, DEEPSEA:0.50, DESERT:0.10, SNOW:0.00, ROCK:0.10, VOLCANO:0.20 },
+  human: { FOREST:0.70, PLAIN:0.90, GRASS:0.80, HILL:0.60, MOUNT:0.30, SWAMP:0.30, BEACH:0.50, SEA:0.60, DEEPSEA:0.00, DESERT:0.30, SNOW:0.20, ROCK:0.20, VOLCANO:0.20 }
+};
+function fit(race,b){ return TERRAIN_FIT[race][b]||0; }
+function homeBonus(race,b){ return 1+(fit(race,b)-0.5)*0.30; }
+// 地形侵蚀规则：单位在偏好地形上活动时，小概率改造相邻地形
+const TERRAFORM={
+  forest:{ from:['PLAIN','GRASS','DESERT'], to:'FOREST' },
+  dwarf: { from:['HILL'], to:'MOUNT' },
+  nomad:{ from:['DESERT','PLAIN'], to:'GRASS' },
+  sea:   { from:['BEACH','PLAIN','GRASS'], to:'SWAMP' },
+  human: { from:['GRASS','FOREST'], to:'PLAIN' }
+};
+let terraformingDirty=false; // 是否需要重绘背景
 const RACE_NAME={ forest:'精灵(森林族)', dwarf:'矮人(矮人族)', nomad:'人马(游牧族)', sea:'海妖(海妖族)', human:'人类' };
 
 const W=96, H=54, CELL=13;
@@ -138,7 +158,7 @@ let gameOver=false;
 const MAX_EVENTS=15;
 const RACE_IDX={forest:1,dwarf:2,nomad:3,sea:4,human:5};
 const TERR_COL=['','#00e676','#ff9100','#ff1744','#00b0ff','#ffea00'];
-let power='rain', brushR=2, hoverI=-1, hoverJ=-1, painting=false, showBorder=false;
+let power='rain', brushR=2, hoverI=-1, hoverJ=-1, painting=false, showBorder=false, terraforming=false;
 let charmState=null;  // { agent, step } 蛊惑选中状态
 let PERF_DEBUG=false, perfStats={move:0,combat:0,eco:0,draw:0,frames:0,lastLog:0};
 
@@ -250,24 +270,35 @@ function pickTarget(a){
     else if(a.race==='forest') range=22;
     else if(a.race==='dwarf') range=14; // 矮人即使压力高也不太愿走远
   }
-  // 压力状态下，优先寻找 frontier（同族适宜但非本族领地）
   const ri=RACE_IDX[a.race];
+  // 优先：高适性地形（≥0.8）
+  for(let k=0;k<10;k++){
+    const ti=a.homeI+Math.floor((Math.random()-0.5)*range);
+    const tj=a.homeJ+Math.floor((Math.random()-0.5)*range);
+    if(ti<1||tj<1||ti>=W-1||tj>=H-1) continue;
+    const idx=tj*W+ti;
+    if(river[idx] || fit(a.race,biome[idx])<0.8) continue;
+    a.tx=ti+0.5; a.ty=tj+0.5; return;
+  }
+  // 压力状态下，优先 frontier（适性≥0.5 且非本族领地）
   if(pressure>threshold){
     for(let k=0;k<20;k++){
       const ti=a.homeI+Math.floor((Math.random()-0.5)*range);
       const tj=a.homeJ+Math.floor((Math.random()-0.5)*range);
       if(ti<1||tj<1||ti>=W-1||tj>=H-1) continue;
       const idx=tj*W+ti;
-      if(river[idx] || !HAB[a.race].includes(biome[idx])) continue;
+      if(river[idx] || fit(a.race,biome[idx])<0.5) continue;
       if(terr[idx]!==ri){ a.tx=ti+0.5; a.ty=tj+0.5; return; }
     }
   }
+  // 保底：任何可进入地形（适性>0）
   for(let k=0;k<10;k++){
     const ti=a.homeI+Math.floor((Math.random()-0.5)*range);
     const tj=a.homeJ+Math.floor((Math.random()-0.5)*range);
     if(ti<1||tj<1||ti>=W-1||tj>=H-1) continue;
     const idx=tj*W+ti;
-    if(!river[idx] && HAB[a.race].includes(biome[idx])){ a.tx=ti+0.5; a.ty=tj+0.5; return; }
+    if(river[idx] || fit(a.race,biome[idx])<=0) continue;
+    a.tx=ti+0.5; a.ty=tj+0.5; return;
   }
   a.tx=a.homeI+0.5; a.ty=a.homeJ+0.5;
 }
@@ -291,14 +322,14 @@ function countNearbyRace(i,j,race,radius){
   return c;
 }
 function findSpawnFrontier(a, radius){
-  // 在较大范围内寻找同族适宜且密度低的格子
+  // 在较大范围内寻找适性≥0.5 且密度低的格子
   const r=LOCAL_DENSE[a.race];
   const cx=Math.round(a.x), cy=Math.round(a.y);
   let best=null, bestScore=-Infinity;
   for(let j=Math.max(1,cy-radius); j<Math.min(H-1,cy+radius); j++){
     for(let i=Math.max(1,cx-radius); i<Math.min(W-1,cx+radius); i++){
       const idx=j*W+i;
-      if(river[idx] || !HAB[a.race].includes(biome[idx])) continue;
+      if(river[idx] || fit(a.race,biome[idx])<0.5) continue;
       const d=Math.hypot(i-a.x, j-a.y);
       const c=countNearbyRace(i,j,a.race,1);
       if(c>=r) continue;
@@ -310,27 +341,27 @@ function findSpawnFrontier(a, radius){
   return best;
 }
 function spawnNear(a){
-  // 优先尝试附近低密度格子
+  // 优先尝试附近适性≥0.8 的低密度格子
   for(let k=0;k<6;k++){
     const i=Math.round(a.x)+Math.floor((Math.random()-0.5)*6);
     const j=Math.round(a.y)+Math.floor((Math.random()-0.5)*6);
     if(i<1||j<1||i>=W-1||j>=H-1) continue;
     const idx=j*W+i;
-    if(river[idx] || !HAB[a.race].includes(biome[idx])) continue;
+    if(river[idx] || fit(a.race,biome[idx])<0.8) continue;
     if(countNearbyRace(i,j,a.race,1) < LOCAL_DENSE[a.race]) return newAgent(a.race,i,j);
   }
-  // 附近太挤，尝试 frontier
+  // 附近太挤，尝试 frontier（适性≥0.5）
   const f=findSpawnFrontier(a, 12);
   if(f) return newAgent(a.race,f.i,f.j);
-  // 人马/人类即使找不到 frontier 也会在次适宜地生成（流浪儿）
+  // 人马/人类即使找不到 frontier 也会在适性≥0.3 的地形生成（流浪儿）
   if(a.race==='nomad' || a.race==='human'){
     for(let k=0;k<8;k++){
       const i=Math.round(a.x)+Math.floor((Math.random()-0.5)*14);
       const j=Math.round(a.y)+Math.floor((Math.random()-0.5)*14);
       if(i<1||j<1||i>=W-1||j>=H-1) continue;
       const idx=j*W+i;
-      if(river[idx]) continue;
-      if(biome[idx]==='GRASS' || biome[idx]==='PLAIN') return newAgent(a.race,i,j);
+      if(river[idx] || fit(a.race,biome[idx])<0.3) continue;
+      return newAgent(a.race,i,j);
     }
   }
   return null;
@@ -368,7 +399,12 @@ function ecoTick(){
         const idx=Math.round(a.y)*W+Math.round(a.x);
         if(biome[idx]==='FOREST') forestBonus=1.10;
       }
-      const rEff=P.r*(1-n/K)*settleBonus*rankPenalty*forestBonus*perfPenalty;
+      // 非核心栖息地繁殖惩罚：适性<0.8 时繁殖率下降
+      let habBonus=1.0;
+      const idx=Math.round(a.y)*W+Math.round(a.x);
+      if(fit(a.race,biome[idx])<0.8) habBonus=0.7;
+      if(fit(a.race,biome[idx])<0.5) habBonus=0.3;
+      const rEff=P.r*(1-n/K)*settleBonus*rankPenalty*forestBonus*perfPenalty*habBonus;
       if(rEff>0 && Math.random()<rEff*ECO_INTERVAL*0.14){
         const baby=spawnNear(a); if(baby){ newborns.push(baby); pop[a.race]++; }
       }
@@ -468,9 +504,9 @@ function renderTerritory(){
   }
   t.globalAlpha=1;
 }
-function findFrontier(race){                   // 找未被本族占据的适宜新地
+function findFrontier(race){                   // 找未被本族占据的适性≥0.5 新地
   const ri=RACE_IDX[race];
-  // 海妖优先沿水域/沼泽边缘扩散：从已有同族附近找 frontier
+  // 海妖/人马优先从现有同族附近扩散
   const biasFromRace=race==='sea' || race==='nomad';
   let cx, cy;
   if(biasFromRace){
@@ -487,7 +523,7 @@ function findFrontier(race){                   // 找未被本族占据的适宜
       i=1+Math.floor(Math.random()*(W-2)); j=1+Math.floor(Math.random()*(H-2));
     }
     const idx=j*W+i;
-    if(river[idx] || !HAB[race].includes(biome[idx]) || terr[idx]===ri) continue;
+    if(river[idx] || fit(race,biome[idx])<0.5 || terr[idx]===ri) continue;
     return {i,j};
   }
   return null;
@@ -509,9 +545,6 @@ function expansion(){                           // 人口压力→派开拓者
 
 // ---------- 侵略 / 战争 ----------
 const STR={ forest:1.0, dwarf:1.5, nomad:1.1, sea:0.8, human:1.0 };   // 各族战力
-
-// 主场优势：在适宜栖息地内战斗时的战力加成
-const HOME_BONUS={ forest:1.20, dwarf:1.25, nomad:1.15, sea:1.15, human:1.05 };
 
 // ---------- BOSS系统 ----------
 const MAX_WORLD_BOSS=2;                 // 每局最多2次世界BOSS
@@ -618,8 +651,9 @@ function combatTick(grid){
         if(Math.hypot(a.x-b.x,a.y-b.y)<attackRange && Math.random()<0.35){
           a.fight=8; b.fight=8;
           const idxA=Math.round(a.y)*W+Math.round(a.x), idxB=Math.round(b.y)*W+Math.round(b.x);
-          const homeA=HAB[a.race].includes(biome[idxA])?HOME_BONUS[a.race]:1.0;
-          const homeB=HAB[b.race].includes(biome[idxB])?HOME_BONUS[b.race]:1.0;
+          // 地形适性战斗加成：适性1.0→+15%，0.5→0%，0→-15%
+          const homeA=homeBonus(a.race, biome[idxA]);
+          const homeB=homeBonus(b.race, biome[idxB]);
           // 神力专属地形额外加成：矮人山地+10%，海妖水域+10%
           let terraA=1.0, terraB=1.0;
           if(a.race==='dwarf' && biome[idxA]==='MOUNT') terraA=1.10;
@@ -1434,6 +1468,7 @@ function draw(){
     ctx=cv.getContext('2d'); ctx.scale(dpr,dpr); ctx.imageSmoothingEnabled=false;
   }
   ctx.imageSmoothingEnabled=false;
+  if(terraformingDirty && frame%60===0){ renderBg(); terraformingDirty=false; }
   ctx.drawImage(bg,0,0,W*CELL,H*CELL);
   if(document.getElementById('terr').checked) ctx.drawImage(terrCv,0,0,W*CELL,H*CELL);
   for(const s of settlements) drawSettlement(ctx,s);
@@ -1491,11 +1526,11 @@ function tick(){
       else {
         let moveSp=sp;
         if(activeArtifacts[a.race] && ARTIFACTS[activeArtifacts[a.race].key].effect==='speed') moveSp*=1.5;
-        // 人马在丘陵上移动速度+15%
-        if(a.race==='nomad'){
-          const idx=Math.round(a.y)*W+Math.round(a.x);
-          if(biome[idx]==='HILL') moveSp*=1.15;
-        }
+        // 地形适性影响移动速度：0.35 ~ 1.0
+        const idx=Math.round(a.y)*W+Math.round(a.x);
+        moveSp *= (0.35 + fit(a.race,biome[idx])*0.65);
+        // 人马在丘陵上额外+15%
+        if(a.race==='nomad' && biome[idx]==='HILL') moveSp*=1.15;
         // 开拓者临时加速
         if(a.frontierBoost>0){ moveSp*=1.3; a.frontierBoost--; }
         a.x+=dx/dist*moveSp; a.y+=dy/dist*moveSp; a.facing=dx>=0?1:-1; a.moving=true;
@@ -1505,6 +1540,26 @@ function tick(){
       for(let tj=-1;tj<=1;tj++)for(let ti=-1;ti<=1;ti++){
         const ni=ai+ti,nj=aj+tj; if(ni<0||nj<0||ni>=W||nj>=H) continue;
         terr[nj*W+ni]=ri;
+      }
+      // 地形侵蚀（可选，默认关闭）
+      if(terraforming && frame%3===0 && Math.random()<0.001){
+        const idx=aj*W+ai;
+        if(fit(a.race,biome[idx])>=0.8){
+          const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+          const [di,dj]=dirs[Math.floor(Math.random()*4)];
+          const ni=ai+di, nj=aj+dj;
+          if(ni>=0 && nj>=0 && ni<W && nj<H){
+            const nidx=nj*W+ni;
+            if(!river[nidx]){
+              const rule=TERRAFORM[a.race];
+              if(rule && rule.from.includes(biome[nidx])){
+                biome[nidx]=rule.to;
+                recalc(ni,nj);
+                terraformingDirty=true;
+              }
+            }
+          }
+        }
       }
     }
     tMove=PERF_DEBUG?performance.now()-tm0:0;
@@ -1572,6 +1627,9 @@ document.querySelectorAll('.pw').forEach(b=>{ b.onclick=()=>{ power=b.dataset.p;
   document.querySelectorAll('.pw').forEach(x=>x.classList.remove('active')); b.classList.add('active'); }; });
 document.querySelector('.pw').classList.add('active');
 document.getElementById('brush').oninput=function(){ brushR=+this.value; document.getElementById('brushVal').textContent=this.value; };
+// 地形侵蚀开关
+const terraformCb=document.getElementById('terraform');
+if(terraformCb) terraformCb.onchange=function(){ terraforming=this.checked; };
 // 边界线开关
 const borderCb=document.getElementById('border');
 borderCb.onchange=function(){ showBorder=this.checked; renderTerritory(); };
